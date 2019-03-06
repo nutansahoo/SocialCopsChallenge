@@ -1,0 +1,511 @@
+---
+title: "SocialCops challenge"
+author: "Nutan Sahoo"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE, message=FALSE, error=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages required
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(dplyr)
+library(plyr)
+library(zoo)
+library(ggplot2)
+library(caroline)
+library(forecast)
+library(DT)
+```
+
+## Data Pre-processing
+```{r}
+# read in the data file
+data<- read.csv("Monthly_data_cmo.csv", header = TRUE)
+# arranging the data frame by date
+# in case of month and year as.Date is the wrong tool here. we will use the zoo package here.
+data<- data[order(as.yearmon(data$date, "%Y-%m")), ] # this sorts rows according to month and year.
+
+```
+
+
+```{r}
+dim(data)
+summary(data)
+#This is what the data looks like
+head(data,5)
+```
+Data contains 62429 observations on 11 variables. Those 11 variables are:
+```{r}
+names(data)
+```
+
+##### Variable Description:  
+
+
+1. APMC: Agricultural produce market committee.
+2. msprice: Minimum Support Price
+3. arrivals_in_qtl: Quantity arrival in market (in quintal)
+4. min_price: Minimum price charged per quintal
+5. max_price: Maximum price charged per quintal
+6. modal_price: Mode (Average) price charged per quintal
+
+```{r}
+print(paste0("There are ", length(unique(data$Commodity)), " commodities"))
+```
+
+Names of some commodities are written in small as well as capital letters. So it was converted to lower.
+```{r}
+# Convert comm. name lower case
+data$Commodity<- sapply(data$Commodity, tolower)
+print(paste0("Now there are ", length(unique(data$Commodity)), " commodities"))
+```
+
+```{r}
+# no of observations for each of the commodity
+com_data <- groupBy(data, by="Commodity", aggregation = "length", clmns = c("min_price", "modal_price"))
+
+#removing commodities which have less than 30 data points
+com_data <- com_data[which(com_data$min_price>=27), ]
+
+#subsetting data accordingly
+subset_data <- data[data$Commodity %in% rownames(com_data), ]
+
+print(paste0("Number of commodities omitted: ",length(rownames(com_data[which(com_data$min_price<27), ]))))
+```
+
+For a given commodity in an APMC, are 27 data points (prices from Sept, 2014 to Nov, 2016). Commodities having less than 27 observations were omitted from the analyis as they were too less to have given us any meaningful insights. 69 commodities Inclding amba koy, amla, aster, banana(raw) were removed. Most of them had less that 10 observations corresponding to them.
+
+## Outliers
+
+### Plotting price distribution of a random sample of Commodities
+
+```{r}
+# randomly select 9 commodities from 
+
+set.seed(4)
+sampled_com<- rownames(com_data)[sample.int(dim(com_data)[1], size = 9)]
+
+{par(mfrow=c(3,3))
+for(i in sampled_com){
+  hist(data$min_price[data$Commodity==i], xlab = "min_price", main=i, col="#A7A7A7")
+  abline(v=mean(data$min_price[data$Commodity==i]), col = "blue", lwd=2.5, lty="dotted")
+}}
+
+{par(mfrow=c(3,3))
+for(i in sampled_com){
+  hist(data$modal_price[data$Commodity==i], xlab = "modal_price", main=i, col="#A7A7A7", breaks = 15)
+  abline(v=mean(data$modal_price[data$Commodity==i]), col = "blue", lwd=2.5, lty="dotted")
+}}
+
+```
+
+Some seem to be approximately normally distributed. We will perform the test for normality on prices of all commodities. If the data is normally distributed, any score not lying within the 3 standard deviations from mean would be treated as an outlier and will be omitted from the analysis. Shapiro-Wilk test was used for testing normality as it has the best power for given significance out of Shapiro–Wilk, Kolmogorov–Smirnov, Lilliefors and Anderson–Darling tests. 
+
+```{r}
+# function for testing normality
+normality_test<- function(x){
+  pval <- shapiro.test(x)$p.value
+  if(pval<=0.05){
+    result<- "Not normal"
+  }else{
+    result<- "Normal"
+    
+  }
+  return(result)
+  
+}
+
+# Split prices by com then applying the function for testing normality and then combine
+non<- aggregate(cbind(min_price, modal_price, max_price) ~ Commodity, data = subset_data, FUN = normality_test)
+head(non)
+
+```
+
+### Removing outliers
+
+```{r}
+# function for detecting outliers 
+outliers<- function(x){
+  H <- 1.5*IQR(x, na.rm = T)
+  q1 <- summary(x)[[2]]
+  q3<- summary(x)[[5]]
+  return(x[x>q3+H | x<q1-H])
+}
+outliers_normal<- function(x){
+  d<- (x-mean(x))/sd(x)
+  
+  return(x[d>3 | d<(-3)])
+}
+
+#normal
+
+for (i in non$Commodity[non$min_price=="Normal"] ){
+  outlier <- outliers_normal(data$min_price[data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data<- subset_data[-which((subset_data$min_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+# non normal
+for (i in non$Commodity[non$min_price=="Not normal"]){
+  outlier <- outliers(subset_data$min_price[subset_data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data <- subset_data[-which((subset_data$min_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+```
+
+Similarly, outliers in the `max_price` and `modal_price` also need to be removed. Dim of subset_data is `59730    11`.
+
+```{r}
+
+#normal
+for (i in non$Commodity[non$modal_price=="Normal"] ){
+  outlier <- outliers_normal(subset_data$modal_price[subset_data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data<- subset_data[-which((subset_data$modal_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+# non normal
+for (i in non$Commodity[non$modal_price=="Not normal"] ){
+  outlier <- outliers(subset_data$modal_price[subset_data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data<- subset_data[-which((subset_data$modal_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+#normal
+for (i in non$Commodity[non$max_price=="Normal"] ){
+  outlier <- outliers_normal(subset_data$max_price[subset_data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data<- subset_data[-which((subset_data$max_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+# non normal
+for (i in non$Commodity[non$max_price=="Not normal"] ){
+  outlier <- outliers(subset_data$max_price[subset_data$Commodity==i])
+  if (length(outlier)==0) next # skip and go to next iteration.
+  subset_data<- subset_data[-which((subset_data$max_price %in% outlier & subset_data$Commodity==i)), ]
+  #print(length(outlier))
+}
+
+
+```
+
+## Descriptive stats
+
+`subset_data` is the processed data and will be used for further analysis.
+```{r}
+dim(subset_data)
+
+print(paste0("There are ", length(unique(subset_data$Commodity)), " commodities"))
+
+```
+
+
+```{r}
+#avg min, max and modal price for all commodities
+aggregate(. ~ Commodity, data = data, FUN = mean)[c("Commodity","min_price","modal_price","max_price")]
+# combine all prices for a com
+combined_prices<- aggregate(cbind(min_price, modal_price, max_price)~Commodity, data=data, FUN=as.vector)
+# Function for calculating median of all prices of a commodity
+median_price<- function(x,y,z){
+  return(median(c(x,y,z)))
+}
+# Function for calculating coeff. of variation of all prices of a commodity
+cvariation <- function(x,y,z){
+  prices <- c(x,y,z)
+  return(sd(prices)/mean(prices))
+}
+#median
+combined_prices$median <- apply(combined_prices[,c("min_price","modal_price","max_price")], 1, function(x) median_price(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]])) 
+
+#coeff. of variation
+combined_prices$coeff_variation <- apply(combined_prices[,c("min_price","modal_price","max_price")], 1, function(x) cvariation(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]])) 
+```
+
+```{r}
+datatable(combined_prices[order(combined_prices$median, decreasing = T),c("Commodity","median","coeff_variation")], extensions = 'AutoFill', options = list(autoFill=T))
+```
+
+The table above sorts the commodity prices by the median prices. Top of the table shows the costliest commodities their median prices and the amount of fluctuation in those prices.
+
+```{r}
+datatable(combined_prices[order(combined_prices$coeff_variation, decreasing = T),c("Commodity","median","coeff_variation")], extensions = 'AutoFill', options = list(autoFill=T))
+
+```
+
+The above table shows the Commodities with the highest variation/fluctuations in their prices.
+
+### time series plots
+
+```{r}
+subset_data <- subset_data[order(as.yearmon(subset_data$date, "%Y-%m")), ] 
+dataforplot <- aggregate(cbind(min_price, modal_price, max_price)~Commodity+date, data = subset_data, FUN = mean)
+
+```
+
+```{r}
+
+#sample 10 commodities
+set.seed(1267)
+comm10<- sample(unique(subset_data$Commodity), size=10, replace = F)
+#concat data for first five
+list_df<- list()
+for (i in 1:3){
+  list_df[[i]] = data.frame(dataforplot[dataforplot$Commodity==comm10[i], ])
+}
+concatenated_df <- ldply(list_df, rbind)
+
+list_df<- list()
+for (i in 4:6){
+  list_df[[i]] = data.frame(dataforplot[dataforplot$Commodity==comm10[i], ])
+}
+concatenated_df1 <- ldply(list_df, rbind)
+```
+
+```{r}
+{ggplot(data=concatenated_df, aes(x=date, y=modal_price, group=Commodity, colour=Commodity))+geom_line()+theme(axis.text.x = element_text(angle = 60, hjust=1))+facet_wrap(~Commodity, ncol = 1, scales="free_y")}
+```
+
+
+```{r}
+{ggplot(data=concatenated_df1, aes(x=date, y=min_price, group=Commodity, colour=Commodity))+geom_line()+theme(axis.text.x = element_text(angle = 60, hjust=1))+facet_wrap(~Commodity, ncol = 1, scales="free_y")}
+```
+
+By looking at the time series plots of a few randomly sampled commodities, no clear seasonal patterns are visible. So statistical tests needs to be performed which can confirm the presence of seasonality. 
+
+```{r}
+# function which takes a vector, converts it into an object of class time series and detects seasonality.
+detect_season<- function(x){
+  if (sum(x %in% 0)!=0){
+    return("na")
+  }else{
+    x<- ts(x, frequency = 12, start = c(2014,9))
+    seasonal_comp<- ets(x)$component[3]
+    return(seasonal_comp)
+  }
+}
+
+```
+
+A simple approach for detecting seasonality is to fit an ETS model using `ets()`, if the chosen model has a seasonal component then the data is seasonal. If the seasonal component is not detected by the model then it gives N (none) in place of a seasonal component. If a seasonal component is detected, a log-liklihood test can be used to test its significance. The aforementioned method of detecting seasonality was [suggested by Prof. Hyndman](https://robjhyndman.com/hyndsight/detecting-seasonality/).   
+
+```{r}
+seasonality <- aggregate(cbind(min_price, modal_price, max_price)~Commodity, data=dataforplot, FUN=detect_season)
+datatable(seasonality, extensions = 'AutoFill', options = list(autoFill=T))
+```
+
+Any series containing missing values have `na` corresponding to them. By looking at the above table, we can conclude that the time series of 'min_price','modal_price' and 'max_price' of any commodity does not have any statistically significant seasonal pattern. It can be because the time series are not long enough for the seasonal patterns to be detected. Here we have 27 data points from Sept 2014 to Nov 2016 for each commodity. Non-parametric tests like [Kolmogrov-smirnov](https://jech.bmj.com/content/jech/33/3/223.full.pdf) and wilcoxon signed-rank test requires the sample size to be atleast 50 and 45 for parametric tests. 
+
+But we do know that many vegetables are seasonal and prices do down in their respective seasons. Let's look at the plots of some seasonal vegetables like Spinach, Bitter gourd, Carrot, etc.
+```{r}
+t<-dataforplot[dataforplot$Commodity=="spinach",c("min_price","modal_price","max_price")]
+t<- ts(t,frequency = 12, start=c(2014,9))
+{plot.ts(t, plot.type = "single", ylab="Prices", col="dark grey", lwd=2, main="Minimum, Modal and Maximum prices\n of Spinach", type="o", panel.first=grid(col="grey"))}
+```
+
+```{r}
+temp<- dataforplot[dataforplot$Commodity=="bitter gourd",c("min_price","modal_price","max_price")]
+temp<- ts(temp,frequency = 12, start=c(2014,9))
+{plot.ts(temp, plot.type = "single", ylab="Prices", col="dark grey", lwd=2, main="Minimum, Modal and Maximum prices\n of Bitter gourd", type="o", panel.first=grid(col="grey"))}
+```
+
+```{r}
+temp<- dataforplot[dataforplot$Commodity=="carrot",c("min_price","modal_price","max_price")]
+temp<- ts(temp,frequency = 12, start=c(2014,9))
+{plot.ts(temp, plot.type = "single", ylab="Prices", col="dark grey", lwd=2, main="Minimum, Modal and Maximum prices\n of carrot", type="o", panel.first=grid(col="grey"))}
+
+```
+
+As expected, the prices do show some seasonal variations. However due to less data, above statistical test was unable to detect it. Time series plots of prices Spinach and Carrot take a dip during the winter season and peak in the off season (summers). And vice versa for Bitter gourd. Since the peaks can be expected to get higher with time due to inflation and will not remain constant throughout time, the **appropriate seasonality type is multiplicative**. 
+So we'll just go ahead and use `decompose()` function in R to break the series into its components and get the seasonal indices.
+
+### Plotting Seasonal Indices of some seasonal vegetables
+
+```{r}
+m<-ts(dataforplot[dataforplot$Commodity=="spinach",c("modal_price")], frequency = 12, start = c(2014,9))
+{plot.ts(decompose(m, type="multiplicative")$seasonal, plot.type = "single", ylab="Seasonal Indices", col="dark grey", lwd=2, main="Seasonal Indices (Spinach)", type="o", panel.first=grid(col="grey"))}
+```
+```{r}
+m<-ts(dataforplot[dataforplot$Commodity=="carrot",c("modal_price")], frequency = 12, start = c(2014,9))
+{plot.ts(decompose(m, type="additive")$seasonal, plot.type = "single", ylab="Seasonal Indices", col="dark grey", lwd=2, main="Seasonal Indices (Carrot)", type="o", panel.first=grid(col="grey"))}
+```
+
+```{r}
+m<-ts(dataforplot[dataforplot$Commodity=="bitter gourd",c("modal_price")], frequency = 12, start = c(2014,9))
+{plot.ts(decompose(m, type="additive")$seasonal, plot.type = "single", ylab="Seasonal Indices", col="dark grey", lwd=2, main="Seasonal Indices (Bitter Gourd)", type="o", panel.first=grid(col="grey"))}
+```
+
+## Comparing Prices with MSP
+
+Here, commodity prices were compared with their respective MSP. The following questions can be asked here: Are there any commodities for which the prices are less/more than MSP in Mandis. How often are the commodities sold at prices less than or more than MSP in a particular mandi. Are there any significant differences between the prices of commodities and MSPs in mandis in various years.
+
+
+A metric was devised known as the cost ratio wherein the prices of a commodity in an APMC for a year were divided by their respective MSPs. This ratio tells us whether the prices are x times costlier or cheaper than MSPs in a Mandi. To answer the first question in the preceding paragraph, we calcuated the median of ratios and ranked them from highest to lowest. Then the proportion of ratios greater than 1 was calculated to answer the second question. A t-test was also performed to determine if there are significant differences between the prices and MSP. 
+
+
+```{r}
+# Read files
+msp_data<- read.csv("CMO_MSP_Mandi.csv",header = T)
+msp_data$commodity<- sapply(msp_data$commodity, tolower)
+temp_df<- aggregate(cbind(min_price, modal_price, max_price)~Commodity+APMC+Year, data=subset_data, FUN=as.vector)
+
+# function for calculating the proportion of ratios greater than 1.
+ratio<- function(x, y, z, year, commodity){
+  MSP<- msp_data$msprice[msp_data$year==year & msp_data$commodity==commodity]
+  prices<- c(x,y,z)
+  if (length(MSP)==0){
+    return(NA)
+  }else{
+    ratios<- prices/MSP
+    return(sum(ratios>1)/length(ratios))
+  }
+  
+}
+# function for calculating the median of ratios.
+medianratio<- function(x, y, z, year, commodity){
+  MSP<- msp_data$msprice[msp_data$year==year & msp_data$commodity==commodity]
+  prices<- c(x,y,z)
+  if (length(MSP)==0){
+    return(NA)
+  }else{
+    ratios<- prices/MSP
+    return(median(ratios))
+  }
+  
+}
+
+temp_df$howoften <- apply(temp_df[,c("min_price","Year","Commodity","modal_price","max_price")], 1, function(x) ratio(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]],x["Year"],x["Commodity"])) 
+
+temp_df$median_ratio <- apply(temp_df[,c("min_price","Year","Commodity","modal_price","max_price")], 1, function(x) medianratio(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]], x["Year"],x["Commodity"])) 
+
+# function to get msp for a given year and com
+get_msp<- function(year, commodity){
+  MSP<- msp_data$msprice[msp_data$year==year & msp_data$commodity==commodity]
+  if (length(MSP)==0){
+    return(NA)
+  }else{
+    return(MSP)
+  }
+}
+
+
+
+# making a column of MSPs in temp_df
+temp_df$minsupprice <- apply(temp_df[,c("Year","Commodity")], 1, function(x) get_msp(x["Year"],x["Commodity"]))
+temp_df<- (as.data.frame(temp_df))
+```
+
+
+```{r}
+# ranking by median
+datatable(temp_df[order(temp_df$median_ratio, decreasing = TRUE), c("Commodity","APMC","Year","minsupprice","median_ratio")], extensions = 'AutoFill', options = list(autoFill = TRUE))
+```
+
+The above table gives us an interesting insight. The median ratio can be interpretated as follows: From row 1 we can say, On an average rice(paddy-husked) had prices 5.3 times higher than the minimum support price in APMC Mumbai in 2014. Whereas in 2015 and 2016 prices were 3.96 and 3.76 times higher respectively than minimum support price. In APMC Pune it was 4.2 times costlier than the minimum support price in 2014. Prices of maize in Udgir were 3.7 times higher on an average in the year 2016. And so on...
+
+
+The same table can be sorted by `median_ratio` in ascending order to find the commodity and mandi where prices are lower than the MSP.
+```{r}
+datatable(temp_df[order(temp_df$median_ratio, decreasing = FALSE), c("Commodity","APMC","Year","minsupprice","median_ratio")][10:100,], extensions = 'AutoFill', options = list(autoFill = TRUE))
+```
+This part of the table is dominated by commodities like Sun flower, Sesamum, sorgum(jawar), paddy(unhusked). The prices of the aforementioned commodities are much lower than the MSPs in various APMCs.
+ 
+
+```{r}
+# Ranking by proportion (of ratios > 1)
+datatable(temp_df[order(temp_df$howoften, decreasing = F), c("Commodity","APMC","Year","minsupprice","howoften")][550:1000,], extensions = 'AutoFill', options = list(autoFill = TRUE))
+```
+
+Feature named `howoften` in the above table was calculated as follows: Firstly the prices of a commodity in an APMC was divided by the respective MSP and then proportion all these ratios greater than one was calculated. The proportion is reported in the last column of the above table. It tells us the proportion of prices of various months  for which a commodity was sold for prices more than MSP in a mandi in that year. For eg. in Nanded, only 2.7% of the prices reported for sorgum(jawar) were more than MSP in year 2015. 
+
+
+
+#### Significance testing using T-Test
+```{r}
+# function for testing normality
+normality_test<- function(x,y,z){
+  prices<- c(x,y,z)
+  if(sd(prices)==0|length(prices)<2){
+    return(NA)
+  }else{
+    pval <- shapiro.test(prices)$p.value
+    if(pval<=0.05){
+      result<- "Not normal"
+    }else{
+      result<- "Normal"
+    
+    }
+    return(result)
+  }
+  
+}
+
+temp_df$normal <- apply(temp_df[,c("min_price","modal_price","max_price")], 1, function(x) normality_test(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]]))
+
+dim(temp_df)[1]; dim(temp_df[temp_df$normal=="Normal", ])[1] 
+```
+
+Test of normality was necessary because t-test was employed for testing whether there exists a significant difference between the MSP and prices of a commodity in an APMC for a given year. The most important assumption in t-test is that the sample is drawn from a normal population.  
+Most of series (of prices) were found to be normal (7249 out of 10569). So we can go ahead and do significance testing.
+
+```{r}
+# function for performing t-test (for finding whether there is any significant difference between the prices and MSP)
+ttest<- function(x, y, z, year, commodity){
+  MSP1<- msp_data$msprice[msp_data$year==year & msp_data$commodity==commodity]
+  prices<- c(x,y,z)
+  if(length(MSP1)!=1|sd(prices)==0){ #if the standard deviation of prices is zero 
+  # or if MSP is not given then return NA
+    return(NA)
+  }else if (is.na(MSP1)) {
+    return(NA)
+  }else{
+    pval<- t.test(x = prices, alternative = "two.sided", mu = MSP1)$p.value
+    if(pval > 0.05){
+      return("No significant diff.")
+    }else{
+      return("Significant diff.")
+    }
+  }
+}
+
+temp_df$significant <- apply(temp_df[,c("min_price","modal_price","max_price","Year","Commodity")], 1, function(x) ttest(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]],x["Year"],x["Commodity"]))
+
+```
+
+
+```{r}
+datatable(temp_df[temp_df$significant=="Significant diff.", c("Commodity","APMC","Year","minsupprice","significant","normal")], extensions = 'AutoFill', options = list(autoFill = TRUE))
+```
+
+Above tables shows prices of which commodity in which APMC and year differ significantly from its Minimum Support Price. 
+
+
+## Studying the price fluctuations
+
+To measure the variation or fluctuations in a sample of prices, coefficient of variation (CV) was chosen. Standard deviation or variance is also a good metric but it cannot be chosen here because they are not dimensionless, hence the fluctuations in prices of potato cannot be compared with the fluctuations in prices of avocados (say). On the other hand, CV is dimensionless and is comparable across measures that differ widely in location and scale.
+
+```{r}
+cvariation <- function(x,y,z){
+  prices <- c(x,y,z)
+  return(sd(prices)/mean(prices))
+}
+
+temp_df$coeff_variation <- apply(temp_df[,c("min_price","modal_price","max_price")], 1, function(x) cvariation(x["min_price"][[1]],x["modal_price"][[1]],x["max_price"][[1]]))
+
+```
+
+```{r}
+datatable(temp_df[order(temp_df$coeff_variation, decreasing = T), c("Commodity","APMC","Year","coeff_variation")], extensions = 'AutoFill', options = list(autoFill = TRUE))
+```
+
+Mandis/APMC and commodities with highest price fluctuations in each year are given in the above table in descending order of CV.
+
